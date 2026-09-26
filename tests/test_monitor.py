@@ -32,6 +32,24 @@ class AvailabilityTests(unittest.TestCase):
         self.assertFalse(monitor.correct_event(monitor.URL.replace(monitor.PERFORMANCE, 'wrong')))
         self.assertFalse(monitor.correct_event(monitor.URL.replace('tickets.bahraingp.com', 'audienceview.queue-it.net')))
 
+    def test_local_currency_and_label_whitespace(self):
+        self.assertEqual(monitor.classify(self.snap(title=' G  Hillstand ', text='G Hillstand RM 200.00')), 'available')
+        self.assertEqual(monitor.classify(self.snap(text='G Hillstand MYR 200.00 Sold out')), 'unknown')
+
+    def test_retry_only_unknown(self):
+        checker = unittest.mock.Mock(side_effect=[('unknown', 'waiting_room'), ('sold_out', 'zone_verified')])
+        sleep = unittest.mock.Mock()
+        self.assertEqual(monitor.observe(checker, sleep), ('sold_out', 'zone_verified', 2))
+        sleep.assert_called_once_with(10)
+        checker = unittest.mock.Mock(return_value=('available', 'zone_verified'))
+        self.assertEqual(monitor.observe(checker, sleep), ('available', 'zone_verified', 1))
+        self.assertEqual(checker.call_count, 1)
+
+    def test_retry_is_bounded(self):
+        checker = unittest.mock.Mock(return_value=('unknown', 'waiting_room'))
+        self.assertEqual(monitor.observe(checker, lambda _: None), ('unknown', 'waiting_room', 2))
+        self.assertEqual(checker.call_count, 2)
+
 
 class StateTests(unittest.TestCase):
     def test_dedup_restock_and_unknown(self):
@@ -71,11 +89,40 @@ class StateTests(unittest.TestCase):
         def fail(message): raise monitor.SafeError('simulated delivery failure')
         with self.assertRaises(monitor.SafeError):
             monitor.process(store, 'available', 'now', fail)
-        self.assertEqual(store.state, INITIAL)
+        self.assertFalse(store.state['availability_notified'])
+        self.assertTrue(store.state['history'][-1]['notification_failed'])
         sent = []
         monitor.process(store, 'available', 'later', sent.append)
         monitor.process(store, 'available', 'later', sent.append)
         self.assertEqual(len(sent), 1)
+
+    def test_audit_preserves_unknown_and_bounds_history(self):
+        state = copy.deepcopy(INITIAL)
+        monitor.audit(state, 'sold_out', 'first', 'zone_verified', 1, 0)
+        for i in range(monitor.HISTORY_LIMIT + 5):
+            monitor.audit(state, 'unknown', str(i), 'waiting_room', 2, 0)
+        self.assertEqual(len(state['history']), monitor.HISTORY_LIMIT)
+        self.assertEqual(state['last_successful_check_at'], 'first')
+        self.assertEqual(state['history'][-1]['reason'], 'waiting_room')
+
+    def test_unchanged_checks_are_still_audited(self):
+        class Store:
+            state = copy.deepcopy(INITIAL)
+            def load(self): return copy.deepcopy(self.state)
+            def save(self, value): self.state = value
+        store = Store()
+        sent = []
+        monitor.process(store, 'sold_out', 'first', sent.append)
+        monitor.process(store, 'sold_out', 'second', sent.append)
+        self.assertEqual(len(store.state['history']), 2)
+        self.assertEqual(store.state['last_checked_at'], 'second')
+        self.assertEqual(sent, [])
+
+    def test_failure_notice_deduplicated(self):
+        with patch('monitor.Path.exists', return_value=False), patch('monitor.GithubState') as factory, patch('monitor.send_telegram') as send:
+            factory.return_value.load.return_value = {'version': 1, 'pipeline_failure_notified': True}
+            monitor.failure_notice()
+            send.assert_not_called()
 
 
 if __name__ == '__main__':
