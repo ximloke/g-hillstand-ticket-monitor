@@ -120,13 +120,21 @@
       "reason": "zone_verified",
       "run_id": "36393469940",
       "status": "sold_out"
+    },
+    {
+      "at": "2026-09-28T16:05:06+00:00",
+      "attempts": 1,
+      "notifications_sent": 0,
+      "reason": "zone_verified",
+      "run_id": "36448373866",
+      "status": "sold_out"
     }
   ],
   "last_change_at": "2026-09-28T07:46:49+00:00",
   "last_check_reason": "zone_verified",
-  "last_checked_at": "2026-09-28T07:46:49+00:00",
+  "last_checked_at": "2026-09-28T16:05:06+00:00",
   "last_status": "sold_out",
-  "last_successful_check_at": "2026-09-28T07:46:49+00:00",
+  "last_successful_check_at": "2026-09-28T16:05:06+00:00",
   "outage_notified": false,
   "unknown_count": 0,
   "version": 1
