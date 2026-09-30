@@ -532,6 +532,18 @@ def daemon_main():
     return 0
 
 
+def test_alert_main():
+    """Send one clearly labelled test alert along the real ticket-alert path."""
+    required('TELEGRAM_BOT_TOKEN')
+    owner = required('TELEGRAM_CHAT_ID')
+    state_path = Path(os.environ.get('STATE_FILE', 'state.json'))
+    subscribers = Subscribers(state_path.with_name('subscribers.json'), owner, 0)  # Read-only here.
+    friends = subscribers.count()
+    alert_sender(subscribers)(TICKET_ALERT_PREFIX + '【测试】这是一条测试通知，页面并没有放票，无需任何操作。')
+    print('Test alert sent to you and ' + str(friends) + ' subscriber(s).')
+    return 0
+
+
 def main():
     required('TELEGRAM_BOT_TOKEN')
     required('TELEGRAM_CHAT_ID')
@@ -562,6 +574,8 @@ if __name__ == '__main__':
     try:
         if '--daemon' in sys.argv:
             sys.exit(daemon_main())
+        if '--test-alert' in sys.argv:
+            sys.exit(test_alert_main())
         sys.exit(failure_notice() if '--failure-notice' in sys.argv else main())
     except SafeError as exc:
         print('Monitor failed: ' + str(exc), file=sys.stderr)

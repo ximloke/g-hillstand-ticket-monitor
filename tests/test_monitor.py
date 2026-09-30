@@ -400,6 +400,21 @@ class SubscriberTests(unittest.TestCase):
         self.assertEqual(poll.call_count, 4)
         self.assertEqual(stop.waits, [10, 10, 1, 1])
 
+    def test_test_alert_reaches_owner_and_friends_and_leaves_state_alone(self):
+        subs = self.subs()
+        subs.add('1', 'A')
+        sent = []
+        def fake(url, headers=None, data=None, method=None):
+            sent.append((str(data['chat_id']), data['text']))
+            return {'ok': True}
+        env = {'TELEGRAM_BOT_TOKEN': '123:fake', 'TELEGRAM_CHAT_ID': self.OWNER,
+               'STATE_FILE': os.path.join(self.dir.name, 'state.json')}
+        with patch.dict(os.environ, env), patch('monitor.request_json', fake):
+            self.assertEqual(monitor.test_alert_main(), 0)
+        self.assertEqual([chat for chat, _ in sent], [self.OWNER, '1'])
+        self.assertTrue(all(text.startswith(monitor.TICKET_ALERT_PREFIX) and '测试' in text for _, text in sent))
+        self.assertEqual(sorted(os.listdir(self.dir.name)), ['subscribers.json'])  # no state.json created
+
     def test_http_403_is_distinguishable_and_leaks_no_url(self):
         error = urllib.error.HTTPError('https://api.telegram.org/botSECRET/sendMessage', 403, 'x', {}, None)
         with patch('urllib.request.OpenerDirector.open', side_effect=error):
