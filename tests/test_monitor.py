@@ -3,6 +3,7 @@ import io
 import os
 import tempfile
 import unittest
+import urllib.error
 from unittest.mock import patch
 import monitor
 
@@ -249,6 +250,163 @@ class DaemonTests(unittest.TestCase):
         monitor.run_daemon(monitor.FileState(os.path.join(self.dir.name, 's.json')), 300, 0, stop,
                            observer=slow, sender=lambda m: None, clock=clock)
         self.assertEqual(stop.waits, [200])
+
+
+class SubscriberTests(unittest.TestCase):
+    OWNER = '900'
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, 'subscribers.json')
+        for stream in ('stdout', 'stderr'):
+            patcher = patch('sys.' + stream, io.StringIO())
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def subs(self, limit=5):
+        return monitor.Subscribers(self.path, self.OWNER, limit)
+
+    def sent_log(self):
+        log = []
+        return log, lambda text, chat_id=None: log.append((chat_id, text))
+
+    def updates(self, *items):
+        """items: (update_id, chat_id, text[, chat_type])"""
+        result = [{'update_id': i, 'message': {'text': text, 'chat': {
+            'id': chat, 'type': (rest[0] if rest else 'private'), 'first_name': 'Friend' + str(chat)}}}
+            for i, chat, text, *rest in items]
+        return lambda method, data: {'ok': True, 'result': result}
+
+    def test_add_remove_limit_and_persistence(self):
+        subs = self.subs(limit=2)
+        self.assertEqual(subs.add('1', 'A'), 'added')
+        self.assertEqual(subs.add('1', 'A'), 'exists')
+        self.assertEqual(subs.add('2', 'B'), 'added')
+        self.assertEqual(subs.add('3', 'C'), 'full')
+        subs.advance(42)
+        again = self.subs(limit=2)
+        self.assertEqual((again.ids(), again.offset), (['1', '2'], 42))
+        self.assertTrue(again.remove('1'))
+        self.assertFalse(again.remove('1'))
+        self.assertEqual(self.subs().ids(), ['2'])
+
+    def test_owner_never_receives_a_duplicate(self):
+        subs = self.subs()
+        subs.add(self.OWNER, 'me')
+        subs.add('1', 'A')
+        self.assertEqual(subs.ids(), ['1'])
+
+    def test_corrupt_subscriber_file_is_never_dropped(self):
+        for content in ['{"subscribers": ', '[]', '{"offset": "x"}']:
+            with self.subTest(content=content):
+                with open(self.path, 'w') as f:
+                    f.write(content)
+                with self.assertRaises(monitor.SafeError):
+                    self.subs()
+
+    def test_ticket_alert_reaches_owner_and_subscribers_only(self):
+        subs = self.subs()
+        subs.add('1', 'A')
+        subs.add('2', 'B')
+        log, send = self.sent_log()
+        sender = monitor.alert_sender(subs, send)
+        alert = monitor.TICKET_ALERT_PREFIX + ' tickets'
+        sender(alert)
+        self.assertEqual(log, [(None, alert), ('1', alert), ('2', alert)])
+        del log[:]
+        for operational in ['⚠️ outage', '✅ recovered', '💓 heartbeat']:
+            sender(operational)
+        self.assertEqual([chat for chat, _ in log], [None, None, None])
+
+    def test_transition_marks_only_the_ticket_alert(self):
+        state, out = monitor.transition(INITIAL, 'available', 'now')
+        self.assertTrue(out[0].startswith(monitor.TICKET_ALERT_PREFIX))
+        state = copy.deepcopy(INITIAL)
+        for _ in range(3):
+            state, out = monitor.transition(state, 'unknown', 'now')
+        self.assertFalse(out[0].startswith(monitor.TICKET_ALERT_PREFIX))
+        _, out = monitor.transition(state, 'sold_out', 'later')
+        self.assertFalse(out[0].startswith(monitor.TICKET_ALERT_PREFIX))
+
+    def test_one_bad_subscriber_does_not_block_others_or_owner(self):
+        subs = self.subs()
+        for chat in ('1', '2', '3'):
+            subs.add(chat, chat)
+        log = []
+        def send(text, chat_id=None):
+            if chat_id == '1':
+                raise monitor.RemoteError(403)   # blocked the bot
+            if chat_id == '2':
+                raise monitor.RemoteError(500)   # transient
+            log.append(chat_id)
+        monitor.alert_sender(subs, send)(monitor.TICKET_ALERT_PREFIX + ' x')
+        self.assertEqual(log, [None, '3'])
+        self.assertEqual(subs.ids(), ['2', '3'])  # only the blocker is dropped
+
+    def test_owner_delivery_failure_propagates_before_any_friend_is_contacted(self):
+        subs = self.subs()
+        subs.add('1', 'A')
+        log = []
+        def send(text, chat_id=None):
+            log.append(chat_id)
+            raise monitor.SafeError('down')
+        with self.assertRaises(monitor.SafeError):
+            monitor.alert_sender(subs, send)(monitor.TICKET_ALERT_PREFIX + ' x')
+        self.assertEqual(log, [None])
+
+    def test_start_stop_flow(self):
+        subs = self.subs()
+        log, send = self.sent_log()
+        monitor.handle_updates(subs, self.updates((10, 111, '/start')), send)
+        self.assertEqual(subs.ids(), ['111'])
+        self.assertEqual(subs.offset, 11)
+        self.assertEqual([chat for chat, _ in log], ['111', None])  # welcome, then owner notice
+        self.assertIn('Friend111', log[1][1])
+        del log[:]
+        monitor.handle_updates(subs, self.updates((11, 111, '/start@my_bot')), send)
+        self.assertIn('已经订阅', log[0][1])
+        del log[:]
+        monitor.handle_updates(subs, self.updates((12, 111, '/stop'), (13, 111, '/stop')), send)
+        self.assertEqual([text for _, text in log], ['已取消订阅。', '你还没有订阅。'])
+        self.assertEqual((subs.ids(), subs.offset), ([], 14))
+
+    def test_ignores_groups_and_owner_and_answers_unknown_text(self):
+        subs = self.subs()
+        log, send = self.sent_log()
+        monitor.handle_updates(subs, self.updates(
+            (1, -100, '/start', 'supergroup'), (2, int(self.OWNER), '/start'), (3, 222, 'hello')), send)
+        self.assertEqual(subs.ids(), [])
+        self.assertEqual([chat for chat, _ in log], [self.OWNER, '222'])
+        self.assertIn('/start', log[1][1])
+        self.assertEqual(subs.offset, 4)
+
+    def test_full_and_failed_reply_still_advance(self):
+        subs = self.subs(limit=1)
+        subs.add('1', 'A')
+        log = []
+        def send(text, chat_id=None):
+            log.append(text)
+            raise monitor.RemoteError(403)
+        monitor.handle_updates(subs, self.updates((5, 333, '/start'), (6, 444, '/start')), send)
+        self.assertEqual(subs.ids(), ['1'])
+        self.assertEqual(subs.offset, 7)
+        self.assertEqual(len(log), 2)
+
+    def test_listener_survives_errors(self):
+        poll = unittest.mock.Mock(side_effect=[RuntimeError('x'), monitor.SafeError('y'), None, None])
+        stop = DaemonTests.Stop(4)
+        monitor.listen_for_subscribers(self.subs(), stop, poll)
+        self.assertEqual(poll.call_count, 4)
+        self.assertEqual(stop.waits, [10, 10, 1, 1])
+
+    def test_http_403_is_distinguishable_and_leaks_no_url(self):
+        error = urllib.error.HTTPError('https://api.telegram.org/botSECRET/sendMessage', 403, 'x', {}, None)
+        with patch('urllib.request.OpenerDirector.open', side_effect=error):
+            with self.assertRaises(monitor.RemoteError) as caught:
+                monitor.request_json('https://api.telegram.org/botSECRET/sendMessage')
+        self.assertEqual(caught.exception.code, 403)
+        self.assertNotIn('SECRET', str(caught.exception))
 
 
 if __name__ == '__main__':

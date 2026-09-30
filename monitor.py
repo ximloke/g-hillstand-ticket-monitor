@@ -27,6 +27,7 @@ STATE_PATH = 'state.json'
 HISTORY_LIMIT = 1000
 MIN_INTERVAL = 10  # Seconds between checks; polling this fast risks an IP block or throttling.
 FAILURES_BEFORE_ALERT = 3
+TICKET_ALERT_PREFIX = '🎟'  # Only messages starting with this reach subscribers.
 MYT = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -39,6 +40,12 @@ def local_time(iso):
 
 class SafeError(Exception):
     """Only constant, non-secret diagnostic messages may be raised here."""
+
+
+class RemoteError(SafeError):
+    def __init__(self, code):
+        super().__init__('Remote API returned HTTP ' + str(code))
+        self.code = code
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -54,7 +61,7 @@ def request_json(url, headers=None, data=None, method=None):
         with urllib.request.build_opener(NoRedirect()).open(request, timeout=25) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
-        raise SafeError('Remote API returned HTTP ' + str(exc.code)) from None
+        raise RemoteError(exc.code) from None
     except (OSError, ValueError):
         # urllib exceptions can contain credential-bearing Telegram URLs.
         raise SafeError('Remote API connection or response failed') from None
@@ -121,13 +128,18 @@ class FileState:
         os.replace(tmp, self.path)  # Atomic: a kill mid-write cannot corrupt state.
 
 
-def send_telegram(text):
+def telegram_call(method, data):
     token = required('TELEGRAM_BOT_TOKEN')
-    chat_id = required('TELEGRAM_CHAT_ID')
     if not re.fullmatch(r'\d+:[A-Za-z0-9_-]+', token):
         raise SafeError('Telegram token format is invalid')
-    result = request_json('https://api.telegram.org/bot' + token + '/sendMessage', data={
-        'chat_id': chat_id, 'text': text, 'link_preview_options': {'is_disabled': True}})
+    return request_json('https://api.telegram.org/bot' + token + '/' + method, data=data)
+
+
+def send_telegram(text, chat_id=None):
+    """Send to `chat_id`, or to the owner (TELEGRAM_CHAT_ID) when omitted."""
+    result = telegram_call('sendMessage', {
+        'chat_id': chat_id or required('TELEGRAM_CHAT_ID'), 'text': text,
+        'link_preview_options': {'is_disabled': True}})
     if result.get('ok') is not True:
         raise SafeError('Telegram did not confirm delivery')
 
@@ -237,7 +249,7 @@ def transition(state, status, now):
         if status == 'sold_out':
             new['availability_notified'] = False
         elif not new.get('availability_notified', False):
-            messages.append('🎟 G Hillstand 页面显示可选！MyKAD Holders Only。请尽快确认并购票。\n检查时间：' + local_time(now) + '\n' + URL)
+            messages.append(TICKET_ALERT_PREFIX + ' G Hillstand 页面显示可选！MyKAD Holders Only。请尽快确认并购票。\n检查时间：' + local_time(now) + '\n' + URL)
             new['availability_notified'] = True
             new['last_ticket_alert_at'] = now
         if was_outage and not messages:
@@ -317,6 +329,135 @@ def env_int(name, default, minimum):
     return value
 
 
+WELCOME = ('✅ 已订阅 G Hillstand（巴林 F1）购票通知：页面出现可选票时会立刻通知你。'
+           '发送 /stop 可取消订阅。\n注意：这只是提醒，不会替你购票，也不保证抢到。')
+HELP = '发送 /start 订阅 G Hillstand（巴林 F1）有票通知，发送 /stop 取消订阅。'
+
+
+class Subscribers:
+    """Friends who pressed /start. Persisted so restarts keep them; safe across threads."""
+
+    def __init__(self, path, owner_id, limit):
+        self.path, self.owner_id, self.limit = Path(path), str(owner_id), limit
+        self.lock = threading.Lock()
+        try:
+            data = json.loads(self.path.read_text())
+            self.people = dict(data.get('subscribers', {}))
+            self.offset = int(data.get('offset', 0))
+        except FileNotFoundError:
+            self.people, self.offset = {}, 0
+        except (ValueError, TypeError, AttributeError):
+            raise SafeError('Subscriber file is corrupt; refusing to drop subscribers') from None
+
+    def _save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + '.tmp')
+        tmp.write_text(json.dumps({'version': 1, 'offset': self.offset, 'subscribers': self.people},
+                                  indent=2, sort_keys=True) + '\n')
+        os.replace(tmp, self.path)
+
+    def ids(self):
+        with self.lock:
+            return [chat_id for chat_id in self.people if chat_id != self.owner_id]
+
+    def count(self):
+        return len(self.ids())
+
+    def add(self, chat_id, name):
+        with self.lock:
+            if chat_id in self.people:
+                return 'exists'
+            if len(self.people) >= self.limit:
+                return 'full'
+            self.people[chat_id] = {'name': name, 'since': dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')}
+            self._save()
+            return 'added'
+
+    def remove(self, chat_id):
+        with self.lock:
+            if self.people.pop(chat_id, None) is None:
+                return False
+            self._save()
+            return True
+
+    def advance(self, offset):
+        with self.lock:
+            self.offset = offset
+            self._save()
+
+
+def alert_sender(subscribers, send=send_telegram):
+    """Ticket alerts also reach subscribers; every other message is for the owner only."""
+    def sender(text):
+        send(text)  # Owner first: if this raises, process() retries the whole alert next cycle.
+        if not text.startswith(TICKET_ALERT_PREFIX):
+            return
+        for chat_id in subscribers.ids():
+            try:
+                send(text, chat_id)
+            except SafeError as exc:
+                # One unreachable friend must not block the others or re-alert the owner.
+                if isinstance(exc, RemoteError) and exc.code == 403:  # Blocked the bot.
+                    subscribers.remove(chat_id)
+                print('Subscriber delivery failed: ' + str(exc), file=sys.stderr, flush=True)
+    return sender
+
+
+def handle_command(subscribers, chat, command, send):
+    chat_id = str(chat['id'])
+    name = str(chat.get('first_name') or chat.get('username') or chat_id)[:40]
+    if chat_id == subscribers.owner_id:
+        send('你是管理员，本来就会收到全部通知，无需订阅。', chat_id)
+    elif command == '/start':
+        outcome = subscribers.add(chat_id, name)
+        if outcome == 'added':
+            send(WELCOME, chat_id)
+            send('👤 新订阅者：' + name + '（' + chat_id + '）。当前共 ' + str(subscribers.count()) + ' 位朋友订阅。')
+        elif outcome == 'exists':
+            send('你已经订阅了。发送 /stop 可取消。', chat_id)
+        else:
+            send('抱歉，订阅人数已满。', chat_id)
+    elif command == '/stop':
+        send('已取消订阅。' if subscribers.remove(chat_id) else '你还没有订阅。', chat_id)
+    else:
+        send(HELP, chat_id)
+
+
+def handle_updates(subscribers, call=telegram_call, send=send_telegram):
+    """Long-poll Telegram once and answer /start and /stop from private chats."""
+    result = call('getUpdates', {'offset': subscribers.offset, 'timeout': 15,
+                                 'allowed_updates': ['message']})
+    if result.get('ok') is not True:
+        raise SafeError('Telegram did not return updates')
+    for update in result.get('result', []):
+        message = update.get('message') or {}
+        chat = message.get('chat') or {}
+        if chat.get('type') == 'private' and 'id' in chat:
+            words = (message.get('text') or '').split()
+            command = words[0].split('@')[0].lower() if words else ''
+            try:
+                handle_command(subscribers, chat, command, send)
+            except SafeError as exc:
+                print('Subscriber reply failed: ' + str(exc), file=sys.stderr, flush=True)
+        subscribers.advance(update['update_id'] + 1)  # Per update: a crash never replays more than one.
+
+
+def listen_for_subscribers(subscribers, stop, poll=handle_updates):
+    """Answer /start and /stop as they arrive. Errors never end the loop."""
+    last_error = None
+    while not stop.is_set():
+        try:
+            poll(subscribers)
+            last_error = None
+            stop.wait(1)  # Guards against a hot loop if a proxy answers long-polls instantly.
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, SafeError) else 'unexpected error'
+            if message != last_error:  # Log a persistent failure once, not every 10 seconds.
+                print('Subscription listener: ' + message, file=sys.stderr, flush=True)
+                last_error = message
+            stop.wait(10)
+
+
 def try_send(sender, text):
     try:
         sender(text)
@@ -370,16 +511,24 @@ def daemon_main():
     required('TELEGRAM_CHAT_ID')
     interval = env_int('CHECK_INTERVAL_SECONDS', 300, MIN_INTERVAL)
     heartbeat_hours = env_int('HEARTBEAT_HOURS', 24, 0)
-    store = FileState(os.environ.get('STATE_FILE', 'state.json'))
+    max_subscribers = env_int('MAX_SUBSCRIBERS', 20, 0)
+    state_path = Path(os.environ.get('STATE_FILE', 'state.json'))
+    store = FileState(state_path)
     store.load()  # Fail now, not hours later, if the state file is unusable.
+    subscribers = Subscribers(state_path.with_name('subscribers.json'),
+                              required('TELEGRAM_CHAT_ID'), max_subscribers)
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
     # A failing send here means bad Telegram settings: exit loudly instead of running deaf.
     send_telegram('✅ G Hillstand 常驻监控已启动：每 ' + str(interval) + ' 秒检查一次，'
                   + ('每 ' + str(heartbeat_hours) + ' 小时发送一次心跳。' if heartbeat_hours else '心跳已关闭。')
+                  + ('\n朋友订阅：给 bot 发 /start 即可（当前 ' + str(subscribers.count()) + ' 位，上限 '
+                     + str(max_subscribers) + '）。' if max_subscribers else '\n朋友订阅已关闭。')
                   + '\n' + URL)
-    run_daemon(store, interval, heartbeat_hours, stop)
+    if max_subscribers:
+        threading.Thread(target=listen_for_subscribers, args=(subscribers, stop), daemon=True).start()
+    run_daemon(store, interval, heartbeat_hours, stop, sender=alert_sender(subscribers))
     return 0
 
 
