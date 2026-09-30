@@ -1,4 +1,7 @@
 import copy
+import io
+import os
+import tempfile
 import unittest
 from unittest.mock import patch
 import monitor
@@ -123,6 +126,129 @@ class StateTests(unittest.TestCase):
             factory.return_value.load.return_value = {'version': 1, 'pipeline_failure_notified': True}
             monitor.failure_notice()
             send.assert_not_called()
+
+
+class FileStateTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, 'nested', 'state.json')
+
+    def test_missing_file_starts_fresh_and_roundtrips(self):
+        store = monitor.FileState(self.path)
+        self.assertEqual(store.load(), INITIAL)
+        store.save({'version': 1, 'unknown_count': 2})
+        self.assertEqual(monitor.FileState(self.path).load(), {'version': 1, 'unknown_count': 2})
+        self.assertEqual(os.listdir(os.path.dirname(self.path)), ['state.json'])
+
+    def test_corrupt_or_foreign_state_is_never_reset(self):
+        os.makedirs(os.path.dirname(self.path))
+        for content in ['{"version": 1', '[]', '{"version": 2}']:
+            with self.subTest(content=content):
+                with open(self.path, 'w') as f:
+                    f.write(content)
+                with self.assertRaises(monitor.SafeError):
+                    monitor.FileState(self.path).load()
+
+    def test_env_int(self):
+        with patch.dict(os.environ, {'X': '120'}):
+            self.assertEqual(monitor.env_int('X', 300, 60), 120)
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(monitor.env_int('X', 300, 60), 300)
+        for bad in ['abc', '59']:
+            with patch.dict(os.environ, {'X': bad}), self.assertRaises(monitor.SafeError):
+                monitor.env_int('X', 300, 60)
+
+
+class DaemonTests(unittest.TestCase):
+    class Stop:
+        """Stands in for threading.Event: runs `cycles` loop iterations, then stops."""
+        def __init__(self, cycles, clock=None, step=300):
+            self.cycles, self.waits, self.clock, self.step = cycles, [], clock, step
+        def is_set(self): return len(self.waits) >= self.cycles
+        def wait(self, seconds):
+            self.waits.append(seconds)
+            if self.clock: self.clock.now += self.step
+
+    class Clock:
+        now = 0.0
+        def __call__(self): return self.now
+
+    def go(self, observations, cycles, heartbeat_hours=0, store=None, sender=None):
+        store = store or monitor.FileState(os.path.join(self.dir.name, 'state.json'))
+        sent = []
+        clock = self.Clock()
+        stop = self.Stop(cycles, clock)
+        observer = unittest.mock.Mock(side_effect=observations)
+        monitor.run_daemon(store, 300, heartbeat_hours, stop, observer=observer,
+                           sender=sender or sent.append, clock=clock)
+        return store, sent, stop, observer
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        for stream in ('stdout', 'stderr'):  # The daemon logs every cycle.
+            patcher = patch('sys.' + stream, io.StringIO())
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_alerts_once_and_keeps_history_across_cycles(self):
+        obs = [('sold_out', 'zone_verified', 1), ('available', 'zone_verified', 1),
+               ('available', 'zone_verified', 1), ('sold_out', 'zone_verified', 1),
+               ('available', 'zone_verified', 1)]
+        store, sent, stop, _ = self.go(obs, 5)
+        self.assertEqual(len(sent), 2)
+        self.assertTrue(all('可选' in m for m in sent))
+        self.assertEqual(len(store.load()['history']), 5)
+        self.assertEqual(stop.waits, [300] * 5)
+
+    def test_state_survives_restart(self):
+        store, sent, _, _ = self.go([('available', 'zone_verified', 1)], 1)
+        _, sent2, _, _ = self.go([('available', 'zone_verified', 1)], 1, store=store)
+        self.assertEqual((len(sent), len(sent2)), (1, 0))
+
+    def test_cycle_error_does_not_stop_loop_and_escalates_once(self):
+        ok = ('sold_out', 'zone_verified', 1)
+        obs = [RuntimeError('boom')] * 4 + [ok]
+        store, sent, _, observer = self.go(obs, 5)
+        self.assertEqual(observer.call_count, 5)
+        self.assertEqual([('运行失败' in m, '已恢复' in m) for m in sent], [(True, False), (False, True)])
+        self.assertEqual(len(sent), 2)
+
+    def test_failure_alert_retried_until_delivered(self):
+        calls = []
+        def flaky(message):
+            calls.append(message)
+            if len(calls) == 1:
+                raise monitor.SafeError('telegram down')
+        _, _, _, _ = self.go([RuntimeError('x')] * 5, 5, sender=flaky)
+        self.assertEqual(len(calls), 2)  # cycle 3's alert fails, cycle 4 delivers, cycle 5 is quiet
+
+    def test_unknown_uses_outage_policy_not_loop_failure(self):
+        obs = [('unknown', 'waiting_room', 2)] * 4
+        _, sent, _, _ = self.go(obs, 4)
+        self.assertEqual(len(sent), 1)
+        self.assertIn('无法确认库存', sent[0])
+
+    def test_heartbeat_reports_counts_and_resets(self):
+        obs = [('sold_out', 'zone_verified', 1)] * 3 + [('unknown', 'waiting_room', 2)] * 1
+        # Checks run at fake t=0, 300, 600, 900; the heartbeat is due at t=800, so on the 4th.
+        store, sent, _, _ = self.go(obs, 4, heartbeat_hours=800 / 3600)
+        beats = [m for m in sent if '💓' in m]
+        self.assertEqual(len(beats), 1)
+        self.assertIn('检查 4 次', beats[0])
+        self.assertIn('售罄 3', beats[0])
+        self.assertIn('无法确认 1', beats[0])
+
+    def test_sleep_accounts_for_check_duration(self):
+        clock = self.Clock()
+        def slow():
+            clock.now += 100
+            return ('sold_out', 'zone_verified', 1)
+        stop = self.Stop(1)
+        monitor.run_daemon(monitor.FileState(os.path.join(self.dir.name, 's.json')), 300, 0, stop,
+                           observer=slow, sender=lambda m: None, clock=clock)
+        self.assertEqual(stop.waits, [200])
 
 
 if __name__ == '__main__':

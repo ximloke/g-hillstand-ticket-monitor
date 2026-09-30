@@ -1,11 +1,17 @@
-"""Read G Hillstand availability once; send deduplicated Telegram alerts."""
+"""Read G Hillstand availability; send deduplicated Telegram alerts.
+
+Default: one check per run (GitHub Actions). With --daemon: check forever.
+"""
 import base64
+import collections
 import copy
 import datetime as dt
 import json
 import os
 import re
+import signal
 import sys
+import threading
 import time
 from pathlib import Path
 import urllib.error
@@ -19,6 +25,8 @@ URL = ('https://tickets.bahraingp.com/Online/seatSelect.asp?createBO%3A%3AWSmap=
 STATE_BRANCH = 'monitor-state'
 STATE_PATH = 'state.json'
 HISTORY_LIMIT = 1000
+MIN_INTERVAL = 60  # Seconds between checks; lower risks getting the IP blocked.
+FAILURES_BEFORE_ALERT = 3
 MYT = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -86,6 +94,31 @@ class GithubState:
             'branch': STATE_BRANCH, 'sha': self.sha,
             'content': base64.b64encode(content.encode()).decode()}, 'PUT')
         self.sha = result['content']['sha']
+
+
+class FileState:
+    """Same interface as GithubState, backed by a local JSON file."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+
+    def load(self):
+        try:
+            state = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return {'version': 1, 'availability_notified': False,
+                    'outage_notified': False, 'unknown_count': 0}
+        except ValueError:
+            raise SafeError('State file is corrupt; refusing to reset alert history') from None
+        if not isinstance(state, dict) or state.get('version') != 1:
+            raise SafeError('Unrecognized monitor state; refusing to reset alert history')
+        return state
+
+    def save(self, state):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + '.tmp')
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + '\n')
+        os.replace(tmp, self.path)  # Atomic: a kill mid-write cannot corrupt state.
 
 
 def send_telegram(text):
@@ -273,6 +306,83 @@ def failure_notice():
     return 0
 
 
+def env_int(name, default, minimum):
+    raw = os.environ.get(name, '').strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        raise SafeError('Setting must be an integer: ' + name) from None
+    if value < minimum:
+        raise SafeError('Setting ' + name + ' must be at least ' + str(minimum))
+    return value
+
+
+def try_send(sender, text):
+    try:
+        sender(text)
+        return True
+    except SafeError as exc:
+        print('Notification not delivered: ' + str(exc), file=sys.stderr, flush=True)
+        return False
+
+
+def run_daemon(store, interval, heartbeat_hours, stop, observer=observe, sender=send_telegram,
+               clock=time.monotonic):
+    """Check every `interval` seconds until `stop` is set; one bad cycle never ends the loop."""
+    tally = collections.Counter()
+    failures = 0
+    failure_alerted = False
+    next_heartbeat = clock() + heartbeat_hours * 3600 if heartbeat_hours else None
+    while not stop.is_set():
+        started = clock()
+        try:
+            status, reason, attempts = observer()
+            now = dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+            sent = process(store, status, now, sender=sender, reason=reason, attempts=attempts)
+            tally[status] += 1
+            failures = 0
+            print(json.dumps({'checked_at': now, 'status': status, 'reason': reason,
+                              'attempts': attempts, 'notifications_sent': sent}), flush=True)
+            if failure_alerted and try_send(sender, '✅ G Hillstand 常驻监控已恢复正常。'):
+                failure_alerted = False
+        except SafeError as exc:
+            failures += 1
+            print('Check cycle failed: ' + str(exc), file=sys.stderr, flush=True)
+        except Exception:
+            failures += 1
+            print('Check cycle failed unexpectedly.', file=sys.stderr, flush=True)
+        if failures >= FAILURES_BEFORE_ALERT and not failure_alerted:
+            # Retried each cycle until delivered, e.g. if Telegram itself is what is failing.
+            failure_alerted = try_send(sender, '⚠️ G Hillstand 常驻监控连续 ' + str(failures)
+                                       + ' 轮运行失败，可能没有完成查票。请查看运行日志；这不表示售罄。')
+        if next_heartbeat is not None and clock() >= next_heartbeat:
+            summary = '，'.join(label + ' ' + str(tally[key]) for key, label in
+                               (('sold_out', '售罄'), ('available', '可选'), ('unknown', '无法确认')))
+            if try_send(sender, '💓 G Hillstand 监控运行正常。过去 ' + format(heartbeat_hours, 'g')
+                        + ' 小时检查 ' + str(sum(tally.values())) + ' 次：' + summary + '。'):
+                tally.clear()
+                next_heartbeat = clock() + heartbeat_hours * 3600
+        stop.wait(max(0, interval - (clock() - started)))
+
+
+def daemon_main():
+    required('TELEGRAM_BOT_TOKEN')
+    required('TELEGRAM_CHAT_ID')
+    interval = env_int('CHECK_INTERVAL_SECONDS', 300, MIN_INTERVAL)
+    heartbeat_hours = env_int('HEARTBEAT_HOURS', 24, 0)
+    store = FileState(os.environ.get('STATE_FILE', 'state.json'))
+    store.load()  # Fail now, not hours later, if the state file is unusable.
+    stop = threading.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: stop.set())
+    # A failing send here means bad Telegram settings: exit loudly instead of running deaf.
+    send_telegram('✅ G Hillstand 常驻监控已启动：每 ' + str(interval) + ' 秒检查一次，'
+                  + ('每 ' + str(heartbeat_hours) + ' 小时发送一次心跳。' if heartbeat_hours else '心跳已关闭。')
+                  + '\n' + URL)
+    run_daemon(store, interval, heartbeat_hours, stop)
+    return 0
+
+
 def main():
     required('TELEGRAM_BOT_TOKEN')
     required('TELEGRAM_CHAT_ID')
@@ -301,6 +411,8 @@ def main():
 
 if __name__ == '__main__':
     try:
+        if '--daemon' in sys.argv:
+            sys.exit(daemon_main())
         sys.exit(failure_notice() if '--failure-notice' in sys.argv else main())
     except SafeError as exc:
         print('Monitor failed: ' + str(exc), file=sys.stderr)
