@@ -19,7 +19,7 @@ docker compose logs -f      # one JSON line per check
 - Sends a Telegram message on start (so a wrong token fails immediately), a heartbeat every 24 hours (`HEARTBEAT_HOURS`, `0` disables), and the same availability, outage and recovery alerts as the Actions version. **A missing heartbeat means the machine or container is down**; the monitor cannot report its own absence.
 - `restart: unless-stopped` brings it back after crashes and reboots. A failed check cycle never ends the loop; three consecutive failed cycles send one alert, and recovery sends one message.
 - State (alert de-duplication, last 1,000 observations) is in `./data/state.json`, written atomically, so restarts do not repeat alerts. Keep that directory.
-- `CHECK_INTERVAL_SECONDS` defaults to 300 and cannot go below 60. Polling faster gains little and risks an IP block.
+- `CHECK_INTERVAL_SECONDS` defaults to 300 and cannot go below 10. Each check starts a fresh browser and can itself take 10+ seconds, so very short values mean back-to-back checks. The ticket site sits behind Cloudflare and Queue-it: frequent polling can get your IP throttled or blocked, which would show up as `unknown` results. If that happens, raise the interval (60+ is much safer).
 - Without Docker: `pip install -r requirements.txt && python -m playwright install --with-deps chromium`, export the variables from `.env.example`, then run `python monitor.py --daemon` under systemd or similar.
 
 Do not run this and the Actions workflow at once unless you want duplicate alerts: they keep separate state. Once the daemon works, disable the workflow under Actions, or leave it as a coarse backup.

@@ -25,7 +25,7 @@ URL = ('https://tickets.bahraingp.com/Online/seatSelect.asp?createBO%3A%3AWSmap=
 STATE_BRANCH = 'monitor-state'
 STATE_PATH = 'state.json'
 HISTORY_LIMIT = 1000
-MIN_INTERVAL = 60  # Seconds between checks; lower risks getting the IP blocked.
+MIN_INTERVAL = 10  # Seconds between checks; polling this fast risks an IP block or throttling.
 FAILURES_BEFORE_ALERT = 3
 MYT = dt.timezone(dt.timedelta(hours=8))
 
