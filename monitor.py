@@ -330,7 +330,7 @@ def env_int(name, default, minimum):
 
 
 WELCOME = ('✅ 已订阅 G Hillstand（巴林 F1）购票通知：页面出现可选票时会立刻通知你。'
-           '发送 /stop 可取消订阅。\n注意：这只是提醒，不会替你购票，也不保证抢到。')
+           '发送 /stop 可取消订阅。\n注意：这只是提醒，不会替你购票，也不保证抢到。\n购票页面：' + URL)
 HELP = '发送 /start 订阅 G Hillstand（巴林 F1）有票通知，发送 /stop 取消订阅。'
 
 

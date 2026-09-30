@@ -363,6 +363,7 @@ class SubscriberTests(unittest.TestCase):
         self.assertEqual(subs.offset, 11)
         self.assertEqual([chat for chat, _ in log], ['111', None])  # welcome, then owner notice
         self.assertIn('Friend111', log[1][1])
+        self.assertIn(monitor.URL, log[0][1])  # the welcome message carries the ticket link
         del log[:]
         monitor.handle_updates(subs, self.updates((11, 111, '/start@my_bot')), send)
         self.assertIn('已经订阅', log[0][1])
