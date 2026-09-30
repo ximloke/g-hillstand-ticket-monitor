@@ -2,6 +2,34 @@
 
 Checks the specified **MyKAD Holders Only** ticketing page for **G Hillstand**, using GitHub Actions and Telegram. No purchase, seat selection, cart operation or CAPTCHA bypass is performed. Other ticket allocations or performance IDs are not monitored.
 
+## Always-on mode (recommended)
+
+`python monitor.py --daemon` checks continuously, every 5 minutes by default, until stopped. Use this rather than the GitHub Actions schedule below when you need the page checked around the clock.
+
+**Why:** GitHub throttles `schedule` triggers for low-activity repositories. From 26–30 Sept this repository's "every 5 minutes" workflow ran 23 times in 4.5 days (median gap about 4.5 hours, longest about 8), against roughly 1,300 requested. A restock lasting a few minutes can fall entirely between two runs. No cron edit fixes that; the process has to be long-lived.
+
+Run it on any machine that stays on (a VPS, a home server, a Raspberry Pi 4/5 or a spare PC) with Docker:
+
+```sh
+cp .env.example .env        # fill in TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+docker compose up -d --build
+docker compose logs -f      # one JSON line per check
+```
+
+- Sends a Telegram message on start (so a wrong token fails immediately), a heartbeat every 24 hours (`HEARTBEAT_HOURS`, `0` disables), and the same availability, outage and recovery alerts as the Actions version. **A missing heartbeat means the machine or container is down**; the monitor cannot report its own absence.
+- `restart: unless-stopped` brings it back after crashes and reboots. A failed check cycle never ends the loop; three consecutive failed cycles send one alert, and recovery sends one message.
+- State (alert de-duplication, last 1,000 observations) is in `./data/state.json`, written atomically, so restarts do not repeat alerts. Keep that directory.
+- **Friends can subscribe themselves.** Give them your bot's `@username`; when they press **Start** they get a confirmation and from then on receive the ticket-available alert (`/stop` unsubscribes). You are told when someone joins. Friends never get outage, failure or heartbeat messages, and never need the bot token. `MAX_SUBSCRIBERS` (default 20; `0` turns this off) caps how many can join, because anyone who finds the bot can press Start. The list is in `./data/subscribers.json`; delete an entry and restart to remove someone. Alerts to friends are best effort: they are sent after yours, one unreachable friend does not block the others, and a friend who blocked the bot is dropped automatically. While the daemon runs it owns the bot's incoming messages, so do not open `getUpdates` in a browser for the same bot (Telegram allows one reader).
+- **Test the alert path:** with the daemon running, open a second terminal in the same folder, set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, and run `python monitor.py --test-alert`. You and every subscriber get one message labelled as a test. It changes no state and does not look at the ticket page.
+- `CHECK_INTERVAL_SECONDS` defaults to 300 and cannot go below 10. Each check starts a fresh browser and can itself take 10+ seconds, so very short values mean back-to-back checks. The ticket site sits behind Cloudflare and Queue-it: frequent polling can get your IP throttled or blocked, which would show up as `unknown` results. If that happens, raise the interval (60+ is much safer).
+- Without Docker: `pip install -r requirements.txt && python -m playwright install --with-deps chromium`, export the variables from `.env.example`, then run `python monitor.py --daemon` under systemd or similar.
+
+Do not run this and the Actions workflow at once unless you want duplicate alerts: they keep separate state. Once the daemon works, disable the workflow under Actions, or leave it as a coarse backup.
+
+## Actions-only mode
+
+The sections below describe the GitHub Actions setup. It needs no server but, per the numbers above, checks far less often than its schedule suggests.
+
 ## September 26 improvements
 
 - Records every observation, including unchanged sellouts, with time, diagnostic reason, attempts and workflow run ID. The latest 1,000 observations (about 3.5 days at an actual five-minute cadence) are in `monitor-state/state.json`; older entries are recoverable from branch history while the repository exists.
@@ -13,7 +41,7 @@ Checks the specified **MyKAD Holders Only** ticketing page for **G Hillstand**, 
 
 ## Schedule and cost
 
-The workflow requests one check every five minutes, offset from the hour (:02, :07, :12, …). GitHub can delay or drop scheduled runs during heavy load, and tickets offered between observations may be missed. Public repositories using standard GitHub-hosted runners qualify for free Actions usage. This workflow uses `ubuntu-24.04`, no paid runner, no external hosting, and no uploaded artifacts.
+The workflow requests one check every five minutes, offset from the hour (:02, :07, :12, …). GitHub can delay or drop scheduled runs (observed: about one run per 4.5 hours), and tickets offered between observations may be missed. Public repositories using standard GitHub-hosted runners qualify for free Actions usage. This workflow uses `ubuntu-24.04`, no paid runner, no external hosting, and no uploaded artifacts.
 
 GitHub may disable scheduled workflows in public repositories after 60 days without repository activity. This is not an uptime guarantee. The target event is in October 2026; disable the workflow when it is no longer useful.
 

@@ -1,0 +1,9 @@
+services:
+  monitor:
+    build: .
+    restart: unless-stopped
+    init: true               # reaps leftover Chromium processes over weeks of uptime
+    stop_grace_period: 90s   # let an in-flight check finish on `docker compose down`
+    env_file: .env
+    volumes:
+      - ./data:/data
